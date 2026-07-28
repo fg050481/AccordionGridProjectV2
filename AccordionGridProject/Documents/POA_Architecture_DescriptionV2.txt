@@ -1,0 +1,313 @@
+﻿═══════════════════════════════════════════════════════════════════════════════
+ POA POC — ARCHITECTURE OF THE THREE FILES
+ AccordionGrid.js  ·  Default.aspx  ·  Default.aspx.cs
+ What each part is and does. Date: 2026-07-27
+═══════════════════════════════════════════════════════════════════════════════
+
+  The POC is three files that form a classic WebForms triad, but organized so the
+  grid stays a REUSABLE, GENERIC component and everything POA-specific lives in
+  the page. Read this top to bottom to understand the whole thing.
+
+  Big picture:
+    AccordionGrid.js   the generic UI component (knows nothing about POA)
+    Default.aspx       the page: grid config + 3 modals + page-level JS
+    Default.aspx.cs    the server: WebMethods + fake services (stand-ins for DB/blob)
+
+  Data flow in one line:
+    browser JS  ──callPageMethod──▶  [WebMethod] static methods  ──▶  fake services
+                ◀── JSON ({ d: "…" }) ──
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ FILE 1 — AccordionGrid.js   (the generic grid component, ~2590 lines, v1.3.0)
+═══════════════════════════════════════════════════════════════════════════════
+
+  WHAT IT IS: a zero-dependency, vanilla-JS grid with expandable (accordion)
+  rows, inline add/edit forms, pagination, sorting, search, column resizing,
+  status badges, and configurable action buttons. It is DESIGNED TO BE GENERIC —
+  it has no idea what a POA is. You hand it columns, fields, and callbacks; it
+  renders and calls you back. This is why the same component could drive any
+  entity grid, not just templates.
+
+  ── Module wrapper (UMD) ────────────────────────────────────────────────────
+    Top of file: a UMD wrapper (root.AccordionGrid = factory()) so it loads as a
+    global. escapeHtml() is a private helper used everywhere output touches the
+    DOM — the XSS guard.
+
+  ── create(elementId, options) ──────────────────────────────────────────────
+    The entry point. Merges your options over defaults (_mergeConfig), stores
+    them on this._config, and initializes internal state:
+        _allData      the full data array the grid holds
+        _pageSize     rows per page
+        _colWidths    column key → px, for user-resized columns
+        _colResizing  transient drag state
+    Config preserves function references (visible/disabled/format/dataLoader)
+    that a naive object clone would drop.
+
+  ── The public API (what the page calls) ────────────────────────────────────
+    loadData(data)          replace the grid's data and render (client-side mode)
+    refresh()               re-run the data source (server mode) or re-render
+    updateRecord(id, patch) OPTIMISTIC in-memory patch of one row + re-render,
+                            WITHOUT re-fetching. Used during extraction polling
+                            and after mapping publish so a badge flips instantly.
+                            KEY BEHAVIOR: in server (dataLoader) mode it does NOT
+                            call _apply() — a re-fetch would overwrite the patch
+                            and hammer the server. The patch is ephemeral: it
+                            survives until the next real page load.
+    insertRecord / removeRecord   client-side add/remove helpers
+    getRecord(id)           find a row by its internal _agId
+    resetColumnWidths()     clear user column resizing
+
+  ── _apply() — the data pipeline ────────────────────────────────────────────
+    The heart of rendering. Two modes:
+      • dataLoader mode (server): shows the loading spinner (_showLoading true),
+        calls the page's dataLoader (which POSTs to GetPage), receives the page
+        of rows + total count, renders, hides the spinner.
+      • client mode: filters/sorts/paginates _allData in memory.
+    Everything (paging, search, sort, refresh) funnels through _apply(), so the
+    spinner appears exactly and only around real data fetches.
+
+  ── _renderBody() / _buildRow(record) ───────────────────────────────────────
+    _renderBody builds the visible page of rows. _buildRow builds ONE row:
+      • the columns, each rendered by its config — a plain value, a badge (from
+        badge.map), or custom HTML from a format(value, record) function. The
+        Extraction column uses format() to inject the clickable { } JSON chip.
+      • the Actions cell: iterates config.actionButtons, honoring
+          visible: bool | fn(record)   → whether the button renders
+          disabled: bool | fn(record)  → native-disabled (fires no click)
+          disabledTitle                → tooltip on a disabled button
+        This is how one button slot shows Extract / "In Progress" (disabled) /
+        Re-Extract depending on the row's status.
+      • the expander caret + the hidden accordion panel (the inline edit form).
+
+  ── Inline add/edit forms ───────────────────────────────────────────────────
+    editFields drive the forms. Field keys MUST match in four places (server
+    flattener → editFields key → editSections → onSave DTO) or values silently
+    drop. Select fields key on <Name>Id (numeric FK).
+      _collectFormValues(panel, target)  reads the form inputs into a buffer
+      _validateRequired(panel, buffer)   REQUIRED-FIELD GATE (v1.3.0): every
+                                         editField with required:true must have a
+                                         value; empties get .ag-field-invalid
+                                         (self-clearing on input), the first is
+                                         focused, and a message lists them.
+      _showRequiredMsg(panel, missing)   renders/clears that message above the
+                                         form's action buttons
+      _finaliseInsert(panel)             completes an insert after any upload
+    The insert flow runs the required gate BEFORE the upload gate, so the user
+    fixes fields first.
+
+  ── Column resizing ─────────────────────────────────────────────────────────
+    Excel-style: drag a header edge to resize, double-click to reset. Widths are
+    stored per-column in _colWidths and applied via a per-instance stylesheet.
+    resetColumnWidths() clears them.
+
+  ── _showLoading(v) ─────────────────────────────────────────────────────────
+    Toggles the spinner overlay over the whole grid. Called only around
+    dataLoader fetches — NOT during extraction polling (there the "In Progress"
+    badge is the progress indicator).
+
+  ── Events (callbacks the page provides) ────────────────────────────────────
+    onActionClick(e)      fired when any action button is clicked; the page
+                          routes on e.action ('edit'/'extract'/'map'/…)
+    onSave / onDelete     inline form submit / row delete
+    onUploadDocument      file upload hook (returns a promise)
+    dataLoader            server data source (returns a promise of {data,total})
+    All are plain config functions — the component calls them and stays generic.
+
+  WHY THIS DESIGN: the grid is a ROUTER, not a POA app. It renders and emits
+  events; the page decides what those mean. That separation is what let mapping,
+  extraction viewing, and rules preview be added as PAGE modules without ever
+  touching the component.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ FILE 2 — Default.aspx   (the page: markup + config + modals + page JS, ~1580 lines)
+═══════════════════════════════════════════════════════════════════════════════
+
+  WHAT IT IS: the POA-specific page. It hosts the grid, configures it for
+  templates, defines the three modals, and holds the page-level JavaScript that
+  wires everything to the server. Everything POA-aware lives here, not in the
+  component.
+
+  ── <style> block (top) ─────────────────────────────────────────────────────
+    Page layout + the { } JSON chip styles + modal-shared bits. (Each modal also
+    has its own scoped style block with its prefix.)
+
+  ── Server controls (the data delivery mechanism) ───────────────────────────
+    <asp:HiddenField HiddenGridData> — initial page of rows as JSON.
+    <asp:HiddenField HiddenLookups>  — lookup lists (dropdown options) as JSON.
+    HiddenFields are the PRIMARY transport for server→browser initial data;
+    RegisterStartupScript is the fallback (resolves ScriptManager/Master Page
+    timing). ClientIDMode=Static keeps the IDs stable for getElementById.
+    <div id="poaGrid"> — the mount point the component renders into.
+
+  ── The grid configuration: AccordionGrid.create('poaGrid', { … }) ──────────
+    This is where the generic component becomes a POA templates grid:
+      columns[]        Description, State, Extraction (badge + { } JSON chip via
+                       format), Mapping (badge), Last Updated, Updated By, Active,
+                       Actions. Width budget is documented inline (fixed columns
+                       sum ~1076px; the remainder flexes to Description).
+      actionButtons[]  Edit · Extract/In-Progress/Re-Extract (status-driven via
+                       visible/disabled) · Map · Generate · Download · Delete.
+      editFields[] / editSections[]   the inline add/edit form (Description is
+                       required:true).
+      dataLoader       → POSTs to GetPage (server paging/search/sort).
+      onSave/onDelete/onUploadDocument/onActionClick → the page callbacks below.
+
+  ── Page-level JavaScript ───────────────────────────────────────────────────
+    callPageMethod(method, payload, onSuccess, onError)
+        THE GENERIC WEBMETHOD CALLER. POSTs JSON to Default.aspx/<method>,
+        unwraps ASP.NET's { d: "json-string" }, parses, calls back. This is the
+        one proven transport; a bug earlier came from modules using their own
+        private fetch instead of this.
+    window.poaCallPageMethod = callPageMethod
+        Exposes it globally so the modal modules (defined outside this closure)
+        share the exact same transport.
+    log(level, msg)
+        The on-screen event log (debugPanel) — a browser-side dev console with
+        four levels (info/warn/err/ok). Backend events only appear here if a
+        WebMethod returns them and the client logs them.
+    onActionClick router
+        Switches on e.action: edit (expand row) · extract/reextract (guarded,
+        see startExtraction) · map (open mapping modal, needs Completed) ·
+        generate · download · delete.
+    startExtraction(agId, record, force) + extractionInFlight lock
+        Guards a double-click race client-side, calls TriggerExtraction, then
+        polls. The server is the real authority; this is convenience.
+    startExtractionPolling(...)
+        Polls GetExtractionStatus every 5s (bounded), flips the badge on
+        terminal status, releases the in-flight lock.
+    { } JSON chip delegated listener
+        ONE click listener on #poaGrid (rows re-render constantly, so per-chip
+        listeners would be lost). On a chip click it reads data-jsonid, finds the
+        record in grid._allData, and opens PoaExtractionViewer.
+
+  ── The three modals (each = scoped CSS + markup + a JS module) ──────────────
+    Every modal follows the same three-layer pattern: a <style> block (its
+    prefix), static markup (always in the DOM, hidden), and a self-contained JS
+    module. All use window.poaCallPageMethod — none has a private fetch.
+
+    1. PoaExtractionViewer  (px- prefix)  — "Normalized Extraction JSON"
+       Opened by the { } JSON chip. Status bar (started/completed/duration),
+       two tabs (Normalized JSON default + Detected fields, fully data-driven),
+       sidebar (Extraction Summary counts + Source Document), copy/download.
+       Calls GetExtractionStructure.
+
+    2. PoaMapping  (pm- prefix)  — "Mapping Summary"
+       Opened by the Map action (needs Completed). Per-field Mapped/Manual/
+       Ignored + C3 data-source dropdown, live counters, Validate (client dry-
+       run) / Save Draft (Partial) / Publish (Mapped). Calls GetMappingData,
+       SaveMappingDraft, PublishMapping. Publish flips the row to Mapped, which
+       is what makes Generate available.
+
+    3. (Rules Preview would slot in here as a third modal, same pattern — not
+       yet built in this file.)
+
+  WHY THIS DESIGN: the page owns all POA knowledge and all server wiring. The
+  modals are page modules, not component features, so the grid stays generic and
+  each modal is independently editable.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ FILE 3 — Default.aspx.cs   (the server: WebMethods + fake services, ~1296 lines)
+═══════════════════════════════════════════════════════════════════════════════
+
+  WHAT IT IS: the code-behind. Static [WebMethod]s the browser calls, plus
+  "Fake" service classes that STAND IN for the real database and blob storage so
+  the POC runs with zero infrastructure. Every fake has a documented production
+  swap.
+
+  ── The WebMethods (the API surface) ────────────────────────────────────────
+    GetPage(...)               server paging/search/sort → returns a page of rows
+                               + total count (the grid's dataLoader target).
+    InsertForm / UpdateForm / DeleteForm    CRUD on a template (DTO wrapped as
+                               { form: dto } to match WebMethod binding).
+    TriggerExtraction(Id, force)   THE GUARDED extraction trigger: rejects if no
+                               record / no document / already In Progress /
+                               already Completed-without-force. Persists status
+                               BEFORE enqueuing so the optimistic badge is backed
+                               by real state. force=true = re-extraction.
+    GetExtractionStatus(Id)    single status read (polled every 5s). In the POC
+                               it also advances the simulated ~8s run to
+                               Completed.
+    GetExtractionStructure(Id) returns the normalized structure + run info +
+                               source doc for the viewer. Reads via
+                               GetOrCreateStructure (blob-first).
+    GetMappingData(Id)         returns the SAME structure's fields + the C3 data-
+                               source catalog + any saved mapping (for the modal).
+    SaveMappingDraft(mapping)  saves decisions, status → Partial (no validation).
+    PublishMapping(mapping)    server-validates, status → Mapped (the authority).
+    TriggerMapping(Id)         legacy stub kept for compatibility.
+    GenerateDocument(Id)       placeholder for the next phase.
+
+  ── GetOrCreateStructure(form) — the single source of truth ─────────────────
+    ONE method both the viewer and the mapping modal call. Blob-first: reads the
+    structure JSON from FakeBlobStorageService; on a miss it generates the
+    engine output, SAVES it to the blob, then returns it (write-once/read-many,
+    like the real pipeline). Because both consumers go through here, what the
+    user MAPS is exactly what the viewer DISPLAYS — one artifact, two windows.
+
+  ── The Fake services (production stand-ins) ────────────────────────────────
+    FakeBlobStorageService   in-memory dictionary keyed by blob path
+                             (poa-extraction/{id}/structure-v1.json). Methods
+                             GetJson/SaveJson/Delete with trace logging.
+                             Production swap: your stream blob service —
+                             StreamReader.ReadToEnd → JToken.Parse.
+    FakeExtractionService    simulates the ~8s job, stamps Completed, versions
+                             runs, and GENERATES the normalized TemplateStructure
+                             (fields with Key/Label/Type/Page/Rect/Confidence/
+                             NeedsReview/Source) mirroring the validated CA run.
+                             Production swap: the real Hangfire job + Azure DI.
+    FakeMappingService       in-memory saved mappings + the hardcoded C3 data-
+                             source catalog + type-based suggestions.
+                             Production swap: mapping table/blob + C3 metadata
+                             service; catalog filtered by field type.
+    FakePoaFormsService      the STATEFUL seed (cached once under a lock) so
+                             status changes survive pagination. GetById,
+                             UpdateExtractionStatus, UpdateMappingStatus,
+                             GetAllForms (paging/search/sort). Production swap:
+                             IPoaFormRepository (Dapper) + IPoaFormsService.
+
+  ── DTOs / models ───────────────────────────────────────────────────────────
+    PoaFormDto / PoaFormModel   the template row shape.
+    MappingDto / MappingFieldDto the mapping payload (FormId + Fields[] of
+                             Key/Mode/Target/Required).
+
+  ── Honest POC boundaries (documented in-file) ──────────────────────────────
+    • Persistence is in-memory — everything resets on app-pool restart.
+    • The structure JSON is a generated realistic sample, not real DI output of
+      each row's actual PDF (one sample serves every row).
+    • Mapping saves decisions to a dictionary, not a versioned mapping-v1.json
+      blob (the envelope is designed, deferred to when generation reads it).
+    • Every fake names its exact production swap.
+
+  WHY THIS DESIGN: static WebMethods keep the browser contract simple; the fake
+  services isolate ALL infrastructure behind swappable seams, so moving to the
+  real DB/blob is a per-method body change, not a rewrite. GetOrCreateStructure
+  as the single source of truth is the linchpin that keeps viewer and mapping in
+  sync.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ HOW THE THREE FILES WORK TOGETHER (one request, end to end)
+═══════════════════════════════════════════════════════════════════════════════
+
+  Example: user clicks the { } JSON chip on a Completed row.
+
+    1. AccordionGrid.js rendered the chip via the Extraction column's format()
+       function, stamping data-jsonid = the form Id.
+    2. Default.aspx's delegated listener on #poaGrid catches the click, reads the
+       Id, finds the record in grid._allData, calls PoaExtractionViewer.open().
+    3. The viewer module calls window.poaCallPageMethod('GetExtractionStructure',
+       {Id}) — the shared transport.
+    4. Default.aspx.cs [WebMethod] GetExtractionStructure runs GetOrCreateStructure
+       → FakeBlobStorageService (blob-first) → returns the structure JSON.
+    5. The viewer renders the tabs, counts, and sidebar from that JSON.
+
+  Same shape for every feature: component renders + emits → page routes + calls
+  → WebMethod + fake service responds → page module renders. The component never
+  knows it's a POA app; the page owns the meaning; the server owns the data.
+
+═══════════════════════════════════════════════════════════════════════════════
+ END
+═══════════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,258 @@
+﻿═══════════════════════════════════════════════════════════════════════════════
+ POA FORM MANAGEMENT — COMPLETE PROCESS OVERVIEW
+ The four phases · the rules.json · open questions on the PO's rules
+ Date: 2026-07-27
+═══════════════════════════════════════════════════════════════════════════════
+
+  Purpose: one place that describes the whole POA pipeline end to end, plus an
+  HONEST list of the rule items the PO's poa_rules.json raises that are out of
+  order, ambiguous, or don't yet make sense — so they can be confirmed with the
+  team instead of guessed at.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ PART 1 — THE FOUR PHASES (the whole pipeline)
+═══════════════════════════════════════════════════════════════════════════════
+
+  Blank state form in  →  fields extracted  →  fields mapped to data  →
+  compliant POA generated.  50+ jurisdictions handled as CONFIGURATION, not code.
+
+───────────────────────────────────────────────────────────────────────────────
+ PHASE 1 · TEMPLATE MANAGEMENT (Upload)                          STATUS: WORKING
+───────────────────────────────────────────────────────────────────────────────
+  What:   onboarding a state's blank POA PDF into the system.
+  UI:     POA Templates grid (AccordionGrid) — add/edit/delete, search, filter,
+          per-row status badges, upload with client + server validation.
+  Engine: UploadDocument.ashx (Generic Handler — WebMethods can't take files);
+          stores under a server-generated GUID (never the client filename);
+          GUID becomes the DocumentReference used by every later phase.
+  Store:  Blob = the blank form.  DB = template row (state, description,
+          document reference, status).  One template per state, reused forever.
+
+───────────────────────────────────────────────────────────────────────────────
+ PHASE 2 · EXTRACTION                                            STATUS: WORKING
+───────────────────────────────────────────────────────────────────────────────
+  What:   turn the blank PDF into a structured field map (WHERE each field is).
+  UI:     Extract action → badge In Progress → polled every 5s → Completed/Error.
+          Completed rows show a { } JSON chip → Normalized Extraction JSON popup
+          (detected fields + raw JSON + summary + source document).
+          Re-Extract re-runs it (warns if a mapping already exists).
+  Engine: background job → fetch PDF → Azure Document Intelligence
+          (prebuilt-layout) → RAW response saved FIRST → NormalizerService
+          (7 detectors, profile-driven per state) → TemplateStructure JSON.
+          Validated on the real CA DE-48 (16 fields, footer noise removed).
+  Store:  Blob = raw DI response + normalized structure (versioned).
+          DB = status, engine + profile version.  Raw kept so the engine can
+          improve and re-run at NO extra AI cost.
+  Config: per-state layout profiles (default.json + {STATE}.json overlay).
+          New state = a config file, not code.
+
+───────────────────────────────────────────────────────────────────────────────
+ PHASE 3 · MAPPING                                               STATUS: POC
+───────────────────────────────────────────────────────────────────────────────
+  What:   decide WHAT data fills each extracted field.
+  UI:     Map action (needs Completed) → Mapping Summary modal. Per field:
+          Mapped (→ C3 data source) · Manual · Ignored. Validate · Save Draft
+          (Partial) · Publish (Mapped). Publish is what unlocks Generate.
+  Engine: mapping service — loads the SAME structure the viewer shows + the C3
+          data-source catalog + any saved mapping; auto-suggests a source by
+          field type; server re-validates on Publish.
+  Store:  Blob = field map (versioned).  DB = mapping row + status + who/when.
+          Versioned so generated documents stay traceable to the map that
+          produced them.
+  Honest POC state: field decisions + validation are real; persistence is
+          in-memory (resets on app-pool restart); the mapping JSON envelope
+          (structureRef/version/publishedBy) is designed, not yet written.
+
+───────────────────────────────────────────────────────────────────────────────
+ PHASE 4 · GENERATION (+ RULES ENGINE)                          STATUS: NEXT
+───────────────────────────────────────────────────────────────────────────────
+  What:   produce the compliant POA — join structure (WHERE) + mapping (WHAT)
+          + the C3 record (VALUES), gated by the PO's business rules.
+  Rules:  PoaRulesService loads poa_rules.json (same pattern as extraction
+          profiles). Pipeline:
+            1. resolve state_rules[state]  (4 enums + booleans)
+            2. resolve agent_id_raw + mail_center → return address / fax
+            3. VALIDATE before render:  BLOCK → stop, nothing rendered
+                                        WARN  → render, flag for review
+            4. branch: paper_poa_generated → pick template, map fields,
+                       scope → checkboxes, WET → blank sig, notary → reserve seal
+                       online_action_required → no PDF, emit portal task
+            5. assemble packet + cover letter [+ officers list] [+ CA blank POA]
+  QA now: Rules Preview — open a state, see resolved rules + BLOCK/WARN outcome,
+          confirm against a reference table; consistency checks flag malformed
+          rules. No test-case authoring.
+  Store:  Blob = generated POA + cover letter.  DB = generation record.
+          Audit log = every action, every user.  Blocked records → exceptions
+          list, never silently dropped.
+
+───────────────────────────────────────────────────────────────────────────────
+ OWNERSHIP — three separate configuration layers (deliberately)
+───────────────────────────────────────────────────────────────────────────────
+  Engineering   → form layout profiles: where the fields are on each state PDF
+  Admin user    → field mapping: which C3 data fills each field
+  Product Owner → state rules + validation: whether/how/for-whom a POA is made
+
+  Key idea: the AI runs ONCE per state template, not per document. Everything
+  after that is a saved map + business rules, so generation is fast, repeatable
+  and auditable.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ PART 2 — THE RULES FILE (poa_rules.json, as the PO created it)
+═══════════════════════════════════════════════════════════════════════════════
+
+  Top-level shape:
+    meta            source, version "1.0", jurisdictions 53, human-verify note
+    mail_centers    Londonderry NH + Missoula MT (firm, PO box, phone, fax)
+    state_rules[]   one object per state — the decision axes + booleans
+    enumerations    allowed values for each enum + severity (BLOCK/WARN)
+
+  Per-state fields:
+    state · document_type · delivery_method · signature_type · processing_owner
+    notary_required · witness_required · officer_list · paper_poa_generated
+    online_action_required · cover_letter_required · form_template · page_count
+    tax_supported · benefit_supported · single_doc_covers_both · mail_center
+    agent_id_raw · notes · raw_signature_col · raw_category_col
+
+  Enumerations captured:
+    document_type    NOTARY · SINGLE_PAGE · MULTI_PAGE · ONLINE_PLUS_PAPER · ONLINE_ONLY
+    delivery_method  PAPER · ONLINE_ONLY · HYBRID
+    signature_type   WET · ELECTRONIC · NONE
+    processing_owner EES_GENERATED · EES_COORDINATOR · EMPLOYER_ONLINE · TPA_REQUEST · EMPLOYER_AND_TPA
+    officer_list     NO · OPTIONAL · REQUIRED
+    scope.service_type  TAX · BENEFIT · BOTH
+    scope.new_or_add    NEW · ADD
+    mail_center      Londonderry, NH · Missoula, MT
+    booleans         TRUE · FALSE
+    severity         BLOCK · WARN
+
+  Transcription status: the accompanying poa_rules.json has the COMPLETE
+  structure with the 12 states legible in the screenshots (AL, AK, AR, AZ, CA,
+  CO, CT, DC, DE, WI, WV, WY). File declares 53 jurisdictions — the remaining
+  ~41 state objects paste in with the identical shape.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ PART 3 — RULE ITEMS THAT ARE OUT OF ORDER / DON'T YET MAKE SENSE
+ (open questions to confirm with the PO — NOT assumptions to code around)
+═══════════════════════════════════════════════════════════════════════════════
+
+  These are honest observations from the file as delivered. Each needs a
+  yes/no from the PO before generation relies on it.
+
+  ── A. Enumerations declare values that no state uses ────────────────────────
+     document_type enum lists ONLINE_PLUS_PAPER, but no transcribed state has
+     it. delivery_method lists HYBRID — also unused so far. officer_list lists
+     REQUIRED — only NO / OPTIONAL appear.
+     Q: are these reserved for the ~41 un-transcribed states, or leftover enum
+        values with no state behind them? If unused, the engine has no branch
+        to exercise and QA can't test them.
+
+  ── B. delivery_method carries an enum value that isn't in its own enum ──────
+     CT has  "delivery_method": "EMPLOYER_ONLINE"  (image 2, line 170, even
+     annotated "-- from ONLINE_ONLY"). But the delivery_method enumeration is
+     only [ PAPER, ONLINE_ONLY, HYBRID ]. EMPLOYER_ONLINE is a processing_owner
+     value, not a delivery_method.
+     Q: is CT's delivery_method a data-entry slip (should it be ONLINE_ONLY),
+        or does delivery_method legitimately reuse processing_owner values?
+        The consistency check WILL flag this as invalid until resolved.
+
+  ── C. document_type vs delivery_method overlap ──────────────────────────────
+     Both can be "ONLINE_ONLY" (AR, CO, CT). document_type is meant to answer
+     "what artifact is produced" and delivery_method "how it reaches the state"
+     — but ONLINE_ONLY appears in both, so the two axes aren't cleanly
+     independent for online states.
+     Q: for an online-only state, which field is authoritative for the
+        "no PDF, emit portal task" branch — document_type, delivery_method, or
+        the paper_poa_generated boolean? Right now three fields encode the same
+        fact and could disagree.
+
+  ── D. The inline "-- from X" edit annotations are still in the data ─────────
+     Several rows carry trailing comments recording a manual change, e.g.:
+        AK   agent_id_raw: "n/a", -- from Agent ID 166
+        CT   processing_owner: "EMPLOYER_ONLINE", --from EES_COORDINATOR
+        WI   witness_required: true, -- from false
+        CA   page_count: 3, -- from 2
+        Missoula fax: "603-719-1026 -- from 703-619-1026"
+     These are human notes, not JSON — some sit INSIDE string values (the
+     Missoula fax literally contains the comment text), which corrupts the
+     value. The fax for Missoula would read "603-719-1026 -- from 703-619-1026"
+     as an actual phone number.
+     Q: are these edits finalized? The build/export must strip the annotations,
+        and the Missoula fax value needs cleaning (is it 603-719-1026 or the
+        old 703-619-1026?). Also NOTE the two mail centers now share the SAME
+        fax (603-719-1026) — is that intended or a copy error?
+
+  ── E. Validation_Rules (BLOCK/WARN definitions) are referenced but not in the JSON
+     The design doc names rule IDs — DEL-070, SIG-021, NOT-031, WIT-040,
+     SCOPE-010, AGT-050 — and the enum has severity [BLOCK, WARN]. But the JSON
+     contains only the severity list, NOT the actual rule definitions (which
+     condition triggers which ID at which severity).
+     Q: where do the rule definitions live, and when are they handed over? Until
+        then the engine can compute OUTCOMES from the data (online-only → no
+        paper, notary → reserve seal) but cannot show rule-ID-level results
+        except as illustrative. This is the single biggest gap for generation.
+
+  ── F. single_doc_covers_both only true for CA, tied to a prose note ─────────
+     CA: single_doc_covers_both=true with notes "1 POA both service types
+     CA EES POA = Prefilled benefit and tax POA + Blank CA POA". The multi-
+     document behavior is described in free-text notes, not structured fields.
+     Q: is CA the only multi-document case (the doc's open items ask this too),
+        and should the "prefilled + blank" packet rule be encoded structurally
+        rather than parsed from a note?
+
+  ── G. agent_id_raw is free-form and inconsistent ────────────────────────────
+     Values seen: "Agent ID 7770008810", "Agent ID 166", "Agent ID DC6B1S",
+     "TPA ID: 500003301", "n/a", "". Different prefixes, some with colons, some
+     alphanumeric, some numeric, some empty.
+     Q: is there a canonical format? Generation resolves agent → return
+        address/fax from this; inconsistent formats make that resolution
+        fragile. Which states legitimately have "n/a" and what does generation
+        do for them?
+
+  ── H. "raw_signature_col" / "raw_category_col" — source columns kept in output
+     Every state carries the original workbook column text (e.g. "wet
+     signature", "Notary Required", "No Paper POA=Online completion only").
+     These are provenance, not engine inputs.
+     Q: are these meant to ship in the runtime JSON, or are they workbook-only
+        and should be dropped on export? They roughly double the file size and
+        duplicate what the structured enums already encode.
+
+  ── I. mail_center on online-only states is ambiguous ────────────────────────
+     AR / CO / CT are online-only (no paper, no mailing) yet still carry a
+     mail_center (Londonderry or Missoula).
+     Q: is the mail_center meaningful for states that never mail anything, or a
+        default filler? If filler, generation should ignore it for online-only
+        outcomes.
+
+  ── J. page_count vs form_template consistency ───────────────────────────────
+     Online-only states have page_count 0 and form_template "" (consistent).
+     But the CA "-- from 2" annotation on page_count=3 suggests the count was
+     manually bumped — does it match the actual CA_POA.pdf?
+     Q: page_count should be derivable from the real template PDF; is it
+        verified against the file, or hand-entered (and thus drift-prone)?
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ PART 4 — HOW TO USE THIS WITH THE TEAM
+═══════════════════════════════════════════════════════════════════════════════
+
+  • Items B and E are BLOCKERS for correct generation — CT's invalid
+    delivery_method will fail the consistency check, and without the
+    Validation_Rules definitions the BLOCK/WARN engine can only show outcomes,
+    not rule-ID results. Raise these first.
+  • Items D, G, H, J are DATA HYGIENE — the export from the workbook needs to
+    strip annotations, clean the Missoula fax, and decide what ships. Owned by
+    whoever exports poa_rules.json.
+  • Items A, C, F, I are DESIGN CLARIFICATIONS — they don't block the current
+    rules-preview story, but generation needs answers before it branches on
+    these fields.
+  • None of these are reasons to hold the rules-engine/preview story — the
+    engine loads and resolves what's there, and the consistency check EXISTS
+    precisely to surface B and similar issues automatically. Frame these as
+    "questions the engine already helps you find," not as defects in your work.
+
+═══════════════════════════════════════════════════════════════════════════════
+ END
+═══════════════════════════════════════════════════════════════════════════════
